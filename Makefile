@@ -1,3 +1,5 @@
+#mac cargo lipo --release --targets "aarch64-apple-darwin,x86_64-apple-darwin" --manifest-path "./Cargo.toml" -p leaf-ffi
+#cbindgen --config leaf-ffi/cbindgen.toml leaf-ffi/src/lib.rs > target/universal/release/leaf.h       
 ios:
 	cargo lipo --release -p leaf-ffi
 	cbindgen --config leaf-ffi/cbindgen.toml leaf-ffi/src/lib.rs > target/universal/release/leaf.h

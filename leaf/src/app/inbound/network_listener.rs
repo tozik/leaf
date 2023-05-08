@@ -1,6 +1,7 @@
 use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Result;
 
@@ -9,6 +10,7 @@ use log::*;
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::mpsc::channel as tokio_channel;
 use tokio::sync::mpsc::{Receiver as TokioReceiver, Sender as TokioSender};
+use tokio::time::timeout;
 
 use crate::app::dispatcher::Dispatcher;
 use crate::app::nat_manager::{NatManager, UdpPacket};
@@ -34,7 +36,8 @@ async fn handle_inbound_datagram(
     // to the socket by the NAT manager. When the NAT manager reads some packets
     // from the right-hand side socket, they would be sent back here through a
     // channel, then we can send them to left-hand side socket.
-    let (l_tx, mut l_rx): (TokioSender<UdpPacket>, TokioReceiver<UdpPacket>) = tokio_channel(100);
+    let (l_tx, mut l_rx): (TokioSender<UdpPacket>, TokioReceiver<UdpPacket>) =
+        tokio_channel(*crate::option::UDP_UPLINK_CHANNEL_SIZE);
 
     tokio::spawn(async move {
         while let Some(pkt) = l_rx.recv().await {
@@ -137,7 +140,11 @@ async fn handle_inbound_tcp_stream(
         ..Default::default()
     };
     // Transforms the TCP stream into an inbound transport.
-    let transport = handler.stream()?.handle(sess, Box::new(stream)).await?;
+    let transport = timeout(
+        Duration::from_secs(*crate::option::INBOUND_ACCEPT_TIMEOUT),
+        handler.stream()?.handle(sess, Box::new(stream)),
+    )
+    .await??;
     handle_inbound_transport(transport, handler, dispatcher, nat_manager).await;
     Ok(())
 }

@@ -34,14 +34,19 @@ fn log_out(data: &[u8]) {
             Ok(s) => s,
             Err(_) => return,
         };
+        const ANDROID_LOG_TAG: &str = "leaf";
         let _ = __android_log_print(
             android_LogPriority_ANDROID_LOG_VERBOSE as std::os::raw::c_int,
-            "leaf".as_ptr() as _,
+            ffi::CString::new(ANDROID_LOG_TAG)
+                .unwrap()
+                .as_c_str()
+                .as_ptr(),
             s.as_c_str().as_ptr(),
         );
     }
 }
 
+#[derive(Debug)]
 pub struct ConsoleWriter(pub BytesMut);
 
 impl Default for ConsoleWriter {

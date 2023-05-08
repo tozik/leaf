@@ -3,7 +3,6 @@ use std::io;
 use std::sync::mpsc::sync_channel;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::Once;
 
 use anyhow::anyhow;
 use lazy_static::lazy_static;
@@ -155,6 +154,7 @@ impl RuntimeManager {
         };
         log::info!("reloading from config file: {}", config_path);
         let mut config = config::from_file(config_path).map_err(Error::Config)?;
+        app::logger::setup_logger(&config.log)?;
         self.router.write().await.reload(&mut config.router)?;
         self.dns_client.write().await.reload(&config.dns)?;
         self.outbound_manager
@@ -249,10 +249,8 @@ impl RuntimeManager {
                             // by an editor, in that case create a new watcher to watch
                             // the new file.
                             if let event::EventKind::Remove(event::RemoveKind::File) = ev.kind {
-                                if let Ok(g) = RUNTIME_MANAGER.lock() {
-                                    if let Some(m) = g.get(&rt_id) {
-                                        let _ = m.new_watcher();
-                                    }
+                                if let Some(m) = RUNTIME_MANAGER.lock().unwrap().get(&rt_id) {
+                                    let _ = m.new_watcher();
                                 }
                             }
                         }
@@ -283,19 +281,15 @@ lazy_static! {
 }
 
 pub fn reload(key: RuntimeId) -> Result<(), Error> {
-    if let Ok(g) = RUNTIME_MANAGER.lock() {
-        if let Some(m) = g.get(&key) {
-            return m.blocking_reload();
-        }
+    if let Some(m) = RUNTIME_MANAGER.lock().unwrap().get(&key) {
+        return m.blocking_reload();
     }
     Err(Error::RuntimeManager)
 }
 
 pub fn shutdown(key: RuntimeId) -> bool {
-    if let Ok(g) = RUNTIME_MANAGER.lock() {
-        if let Some(m) = g.get(&key) {
-            return m.blocking_shutdown();
-        }
+    if let Some(m) = RUNTIME_MANAGER.lock().unwrap().get(&key) {
+        return m.blocking_shutdown();
     }
     false
 }
@@ -361,6 +355,7 @@ pub struct StartOptions {
 }
 
 pub fn start(rt_id: RuntimeId, opts: StartOptions) -> Result<(), Error> {
+    #[cfg(debug_assertions)]
     println!("start with options:\n{:#?}", opts);
 
     let (reload_tx, mut reload_rx) = mpsc::channel(1);
@@ -377,16 +372,7 @@ pub fn start(rt_id: RuntimeId, opts: StartOptions) -> Result<(), Error> {
         Config::Internal(c) => c,
     };
 
-    // FIXME Unfortunately fern does not allow re-initializing the logger,
-    // should consider another logging lib if the situation doesn't change.
-    let log = config
-        .log
-        .as_ref()
-        .ok_or_else(|| Error::Config(anyhow!("empty log setting")))?;
-    static ONCE: Once = Once::new();
-    ONCE.call_once(move || {
-        app::logger::setup_logger(log).expect("setup logger failed");
-    });
+    app::logger::setup_logger(&config.log)?;
 
     let rt = new_runtime(&opts.runtime_opt)?;
     let _g = rt.enter();
@@ -415,6 +401,16 @@ pub fn start(rt_id: RuntimeId, opts: StartOptions) -> Result<(), Error> {
         #[cfg(feature = "stat")]
         stat_manager.clone(),
     ));
+
+    let dispatcher_weak = Arc::downgrade(&dispatcher);
+    let dns_client_cloned = dns_client.clone();
+    rt.block_on(async move {
+        dns_client_cloned
+            .write()
+            .await
+            .replace_dispatcher(dispatcher_weak);
+    });
+
     let nat_manager = Arc::new(NatManager::new(dispatcher.clone()));
     let inbound_manager =
         InboundManager::new(&config.inbounds, dispatcher, nat_manager).map_err(Error::Config)?;
@@ -456,6 +452,11 @@ pub fn start(rt_id: RuntimeId, opts: StartOptions) -> Result<(), Error> {
         )
     ))]
     if let Ok(r) = inbound_manager.get_tun_runner() {
+        runners.push(r);
+    }
+
+    #[cfg(feature = "inbound-cat")]
+    if let Ok(r) = inbound_manager.get_cat_runner() {
         runners.push(r);
     }
 
@@ -538,7 +539,7 @@ pub fn start(rt_id: RuntimeId, opts: StartOptions) -> Result<(), Error> {
 
     RUNTIME_MANAGER
         .lock()
-        .map_err(|_| Error::RuntimeManager)?
+        .unwrap()
         .insert(rt_id, runtime_manager);
 
     log::trace!("added runtime {}", &rt_id);
@@ -548,12 +549,11 @@ pub fn start(rt_id: RuntimeId, opts: StartOptions) -> Result<(), Error> {
     #[cfg(all(feature = "inbound-tun", any(target_os = "macos", target_os = "linux")))]
     sys::post_tun_completion_setup(&net_info);
 
-    rt.shutdown_background();
+    drop(inbound_manager);
 
-    RUNTIME_MANAGER
-        .lock()
-        .map_err(|_| Error::RuntimeManager)?
-        .remove(&rt_id);
+    RUNTIME_MANAGER.lock().unwrap().remove(&rt_id);
+
+    rt.shutdown_background();
 
     log::trace!("removed runtime {}", &rt_id);
 

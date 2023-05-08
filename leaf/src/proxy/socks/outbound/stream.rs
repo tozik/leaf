@@ -1,4 +1,5 @@
 use std::io;
+use async_socks5::Auth;
 
 use async_socks5::Auth;
 use async_trait::async_trait;
@@ -26,10 +27,13 @@ impl OutboundStreamHandler for Handler {
     ) -> io::Result<AnyStream> {
         let mut stream =
             stream.ok_or_else(|| io::Error::new(io::ErrorKind::Other, "invalid input"))?;
-        let auth = Some(Auth{
-            username: self.username.clone(),
-            password: self.password.clone(),
-        });
+        let auth = match (&self.username, &self.password) {
+            (auth_username, _) if auth_username.is_empty() => None,
+            (auth_username, auth_password) => Some(Auth {
+                username: auth_username.to_owned(),
+                password: auth_password.to_owned(),
+            })
+        };
         match &sess.destination {
             SocksAddr::Ip(a) => {
                 let _ = async_socks5::connect(&mut stream, a.to_owned(), auth)

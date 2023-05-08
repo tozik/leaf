@@ -27,6 +27,8 @@ use crate::proxy::amux;
 use crate::proxy::direct;
 #[cfg(feature = "outbound-drop")]
 use crate::proxy::drop;
+#[cfg(feature = "outbound-obfs")]
+use crate::proxy::obfs;
 #[cfg(feature = "outbound-quic")]
 use crate::proxy::quic;
 #[cfg(feature = "outbound-redirect")]
@@ -71,7 +73,7 @@ struct HandlerCacheEntry<'a> {
 impl OutboundManager {
     #[allow(clippy::type_complexity)]
     fn load_handlers(
-        outbounds: &protobuf::RepeatedField<Outbound>,
+        outbounds: &Vec<Outbound>,
         dns_client: SyncDnsClient,
         handlers: &mut HashMap<String, AnyOutboundHandler>,
         #[cfg(feature = "plugin")] external_handlers: &mut super::plugin::ExternalHandlers,
@@ -181,6 +183,32 @@ impl OutboundManager {
                         .datagram_handler(datagram)
                         .build()
                 }
+                #[cfg(feature = "outbound-obfs")]
+                "obfs" => {
+                    let settings =
+                        config::ObfsOutboundSettings::parse_from_bytes(&outbound.settings)
+                            .map_err(|e| anyhow!("invalid [{}] outbound settings: {}", &tag, e))?;
+                    let stream = match &*settings.method {
+                        "http" => Box::new(obfs::HttpObfsStreamHandler::new(
+                            settings.path.as_bytes(),
+                            settings.host.as_bytes(),
+                        )) as _,
+                        "tls" => {
+                            Box::new(obfs::TlsObfsStreamHandler::new(settings.host.as_bytes())) as _
+                        }
+                        method => {
+                            return Err(anyhow!(
+                                "invalid [{}] outbound settings: unknown obfs method {}",
+                                &tag,
+                                method
+                            ))
+                        }
+                    };
+                    HandlerBuilder::default()
+                        .tag(tag.clone())
+                        .stream_handler(stream)
+                        .build()
+                }
                 #[cfg(feature = "outbound-trojan")]
                 "trojan" => {
                     let settings =
@@ -230,10 +258,6 @@ impl OutboundManager {
                     let settings =
                         config::TlsOutboundSettings::parse_from_bytes(&outbound.settings)
                             .map_err(|e| anyhow!("invalid [{}] outbound settings: {}", &tag, e))?;
-                    let mut alpns = Vec::new();
-                    for alpn in settings.alpn.iter() {
-                        alpns.push(alpn.clone());
-                    }
                     let certificate = if settings.certificate.is_empty() {
                         None
                     } else {
@@ -241,8 +265,9 @@ impl OutboundManager {
                     };
                     let stream = Box::new(tls::outbound::StreamHandler::new(
                         settings.server_name.clone(),
-                        alpns.clone(),
+                        settings.alpn.clone(),
                         certificate,
+                        settings.insecure,
                     )?);
                     HandlerBuilder::default()
                         .tag(tag.clone())
@@ -282,6 +307,7 @@ impl OutboundManager {
                         settings.address.clone(),
                         settings.port as u16,
                         server_name,
+                        settings.alpn.clone(),
                         certificate,
                         dns_client.clone(),
                     ));
@@ -564,7 +590,7 @@ impl OutboundManager {
 
     #[allow(unused_variables)]
     fn load_selectors(
-        outbounds: &protobuf::RepeatedField<Outbound>,
+        outbounds: &Vec<Outbound>,
         handlers: &mut HashMap<String, AnyOutboundHandler>,
         #[cfg(feature = "plugin")] external_handlers: &mut super::plugin::ExternalHandlers,
         selectors: &mut super::Selectors,
@@ -643,7 +669,7 @@ impl OutboundManager {
     // TODO make this non-async?
     pub async fn reload(
         &mut self,
-        outbounds: &protobuf::RepeatedField<Outbound>,
+        outbounds: &Vec<Outbound>,
         dns_client: SyncDnsClient,
     ) -> Result<()> {
         // Save outound select states.
@@ -704,10 +730,7 @@ impl OutboundManager {
         Ok(())
     }
 
-    pub fn new(
-        outbounds: &protobuf::RepeatedField<Outbound>,
-        dns_client: SyncDnsClient,
-    ) -> Result<Self> {
+    pub fn new(outbounds: &Vec<Outbound>, dns_client: SyncDnsClient) -> Result<Self> {
         let mut handlers: HashMap<String, AnyOutboundHandler> = HashMap::new();
         #[cfg(feature = "plugin")]
         let mut external_handlers = super::plugin::ExternalHandlers::new();
